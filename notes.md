@@ -932,6 +932,434 @@ mov cr0, eax
   1.让最常见的情况运行得快，核心函数中的核心部分，是影响性能的关键点，它们占据了程序的大部分运行时间，所以要把注意力放在它们身上。
   2.尽量减少每个循环内部的缓存不命中数量，循环是缓存工作的重点，一个循环容易带来性能问题，而它恰好也容易被优化成空间、时间局部性良好的代码
 
+# 08 锁：并发操作中，解决数据同步的四种方法
+
+原子变量，关中断，信号量，自旋锁
+
+## 非预期结果的全局变量
+
+```c
+int a = 0;
+void interrupt_handle(){
+    a++;
+}
+void thread_func(){
+    a++;
+}
+
+```
+
+可能导致结果不确定的情况是这样的：thread_func 函数还没运行完第 2 条指令时，中断就来了。
+
+因此，CPU 转而处理中断，也就是开始运行 interrupt_handle 函数，这个函数运行完 a=1，CPU 还会回去继续运行第 3 条指令，此时 a 依然是 1，这显然是错的。
+
+![img](https://static001.geekbang.org/resource/image/79/4c/79bfa1d036ebb27yy17ae3edf768ba4c.jpeg)
+
+显然在 t2 时刻发生了中断，导致了 t2 到 t4 运行了 interrupt_handle 函数，t5 时刻 thread_func 又恢复运行，导致 interrupt_handle 函数中 a 的操作丢失，因此出错。
+
+## 方法一：原子操作-针对单体变量
+
+把a++变成原子操作
+
+在 C 函数中按照特定的方式嵌入汇编代码
+
+```C
+//定义一个原子类型
+typedef struct s_ATOMIC{
+    volatile s32_t a_count; //在变量前加上volatile，是为了禁止编译器优化，使其每次都从内存中加载变量
+}atomic_t;
+//原子读
+static inline s32_t atomic_read(const atomic_t *v){        
+        //x86平台取地址处是原子
+        return (*(volatile u32_t*)&(v)->a_count);
+}
+//原子写
+static inline void atomic_write(atomic_t *v, int i){
+        //x86平台把一个值写入一个地址处也是原子的 
+        v->a_count = i;
+}
+//原子加上一个整数
+static inline void atomic_add(int i, atomic_t *v){
+        __asm__ __volatile__("lock;" "addl %1,%0"
+                     : "+m" (v->a_count)
+                     : "ir" (i));
+    //"lock;" "addl %1,%0" 是汇编指令部分，%1,%0是占位符，它表示输出、输入列表中变量或表态式，占位符的数字从输出部分开始依次增加，这些变量或者表态式会被GCC处理成寄存器、内存、立即数放在指令中。 
+    //: "+m" (v->a_count) 是输出列表部分，“+m”表示(v->a_count)和内存地址关联
+    //: "ir" (i) 是输入列表部分，“ir” 表示i是和立即数或者寄存器关联
+}
+//原子减去一个整数
+static inline void atomic_sub(int i, atomic_t *v){
+        __asm__ __volatile__("lock;" "subl %1,%0"
+                     : "+m" (v->a_count)
+                     : "ir" (i));
+}
+//原子加1
+static inline void atomic_inc(atomic_t *v){
+        __asm__ __volatile__("lock;" "incl %0"
+                       : "+m" (v->a_count));
+}
+//原子减1
+static inline void atomic_dec(atomic_t *v){
+       __asm__ __volatile__("lock;" "decl %0"
+                     : "+m" (v->a_count));
+}
+```
+
+以上代码中，加上 lock 前缀的 addl、subl、incl、decl 指令都是原子操作，lock 前缀表示锁定总线。
+
+```c
+//GCC支持嵌入汇编代码的模板
+__asm__ __volatile__(代码部分:输出部分列表: 输入部分列表:损坏部分列表);
+```
+
+1. 汇编代码部分，这里是实际嵌入的汇编代码。
+2. 输出列表部分，让 GCC 能够处理 C 语言左值表达式与汇编代码的结合。
+3. 输入列表部分，也是让 GCC 能够处理 C 语言表达式、变量、常量，让它们能够输入到汇编代码中去。
+4. 损坏列表部分，告诉 GCC 汇编代码中用到了哪些寄存器，以便 GCC 在汇编代码运行前，生成保存它们的代码，并且在生成的汇编代码运行后，恢复它们（寄存器）的代码。
+
+它们之间用冒号隔开，如果只有汇编代码部分，后面的冒号可以省略。但是有输入列表部分而没有输出列表部分的时候，输出列表部分的冒号就必须要写，否则 GCC 没办法判断，同样的道理对于其它部分也一样。
+
+## 方法二：中断控制-针对复杂变量
+
+原子操作只适用于单体变量，如整数。
+
+中断是CPU响应外部事件的重要机制，时钟、键盘、硬盘等 IO 设备都是通过发出中断来请求 CPU 执行相关操作的（即执行相应的中断处理代码），比如下一个时钟到来、用户按下了键盘上的某个按键、硬盘已经准备好了数据。但是中断处理代码中如果操作了其它代码的数据，这就需要相应的控制机制了，这样才能保证在操作数据过程中不发生中断。
+
+代码实现开闭中断：
+
+```c
+//关闭中断
+void hal_cli(){
+    __asm__ __volatile__("cli": : :"memory");
+}
+//开启中断
+void hal_sti(){
+    __asm__ __volatile__("sti": : :"memory");
+}
+//使用场景
+void foo(){
+    hal_cli();
+    //操作数据……
+    hal_sti();
+}
+void bar(){
+    hal_cli();
+    //操作数据……
+    hal_sti();
+}
+```
+
+上述代码有重大缺陷，hal_cli()，hal_sti()，无法嵌套使用。
+
+修改：在关闭中断函数中先保存 eflags 寄存器，然后执行 cli 指令，在开启中断函数中直接恢复之前保存的 eflags 寄存器。
+
+```c
+typedef u32_t cpuflg_t;
+static inline void hal_save_flags_cli(cpuflg_t* flags){
+     __asm__ __volatile__(
+            "pushfl \t\n" //把eflags寄存器压入当前栈顶
+            "cli    \t\n" //关闭中断
+            "popl %0 \t\n"//把当前栈顶弹出到flags为地址的内存中        
+            : "=m"(*flags)
+            :
+            : "memory"
+          );
+}
+static inline void hal_restore_flags_sti(cpuflg_t* flags){
+    __asm__ __volatile__(
+              "pushl %0 \t\n"//把flags为地址处的值寄存器压入当前栈顶
+              "popfl \t\n"   //把当前栈顶弹出到flags寄存器中
+              :
+              : "m"(*flags)
+              : "memory"
+              );
+}
+```
+
+hal_restore_flags_sti() 函数的执行，是否开启中断完全取决于上一次 eflags 寄存器中的值，并且 popfl 指令只会影响 eflags 寄存器中的 IF 位。这样，无论函数嵌套调用多少层都没有问题。
+
+## 方法三：自旋锁-协调多核心CPU
+
+- 前述中断控制只能针对单CPU系统，同一时刻只有一条代码执行流。除了中断会中止当前代码执行流，转而运行另一条代码执行流（中断处理程序），再无其它代码执行流。这种情况下只要控制了中断，就能安全地操作全局数据。
+- 但现在CPU变成了多核心，或主板上安装了多个CPU，同一时刻下系统中存在多条代码执行流，控制中断只能控制本地 CPU 的中断，无法控制其它 CPU 核心的中断。
+- 使用自旋锁解决
+
+### 自旋锁原理
+
+首先读取锁变量，判断其值是否已经加锁，如果未加锁则执行加锁，然后返回，表示加锁成功；如果已经加锁了，就要返回第一步继续执行后续步骤，因而得名自旋锁。
+
+![img](file:///home/linxuankun/%E5%9B%BE%E7%89%87/619c27c6400344db2310fb82ce8d5788.webp)
+
+自旋锁正确执行的前提是保证读取锁变量和判断并加锁的操作是原子执行的。否则，CPU0 在读取了锁变量之后，CPU1 读取锁变量判断未加锁执行加锁，然后 CPU0 也判断未加锁执行加锁，这时就会发现两个 CPU 都加锁成功，因此这个算法出错了。
+
+硬件解决方案：x86 CPU 提供了一个原子交换指令，xchg，它可以让寄存器里的一个值跟内存空间中的一个值做交换。例如，让 eax=memlock，memlock=eax 这个动作是原子的，不受其它 CPU 干扰。
+
+```c
+//自旋锁结构
+typedef struct
+{
+     volatile u32_t lock;//volatile可以防止编译器优化，保证其它代码始终从内存加载lock变量的值 
+} spinlock_t;
+//锁初始化函数
+static inline void x86_spin_lock_init(spinlock_t * lock)
+{
+     lock->lock = 0;//锁值初始化为0是未加锁状态
+}
+//加锁函数
+static inline void x86_spin_lock(spinlock_t * lock)
+{
+    __asm__ __volatile__ (
+    "1: \n"
+    "lock; xchg  %0, %1 \n"//把值为1的寄存器和lock内存中的值进行交换
+    "cmpl   $0, %0 \n" //用0和交换回来的值进行比较
+    "jnz    2f \n"  //不等于0则跳转后面2标号处运行
+    "jmp 3f \n"     //若等于0则跳转后面3标号处返回
+    "2:         \n" 
+    "cmpl   $0, %1  \n"//用0和lock内存中的值进行比较
+    "jne    2b      \n"//若不等于0则跳转到前面2标号处运行继续比较  
+    "jmp    1b      \n"//若等于0则跳转到前面1标号处运行，交换并加锁
+    "3:  \n"     :
+    : "r"(1), "m"(*lock));
+}
+//解锁函数
+static inline void x86_spin_unlock(spinlock_t * lock)
+{
+    __asm__ __volatile__(
+    "movl   $0, %0\n"//解锁把lock内存中的值设为0就行
+    :
+    : "m"(*lock));
+}
+```
+
+xchg指令：xchg %0, %1 。
+
+- %0 对应 "r"(1)，表示由编译器自动分配一个通用寄存器，并填入值 1，例如 mov eax，1。而 %1 对应"m"(*lock)，表示 lock 是内存地址。
+- 把 1 和内存中的值进行交换，若内存中是 1，则不会影响；因为本身写入就是 1，若内存中是 0，一交换，内存中就变成了 1，即加锁成功。
+
+### 自旋锁中断嵌套问题
+
+在使用自旋锁的时候仍然要注意中断。
+
+```c
+static inline void x86_spin_lock_disable_irq(spinlock_t * lock,cpuflg_t* flags)
+{
+    __asm__ __volatile__(
+    "pushfq                 \n\t"
+    "cli                    \n\t"
+    "popq %0                \n\t"
+    "1:         \n\t"
+    "lock; xchg  %1, %2 \n\t"
+    "cmpl   $0,%1       \n\t"
+    "jnz    2f      \n\t"
+    "jmp    3f      \n"  
+    "2:         \n\t"
+    "cmpl   $0,%2       \n\t" 
+    "jne    2b      \n\t"
+    "jmp    1b      \n\t"
+    "3:     \n"     
+     :"=m"(*flags)
+    : "r"(1), "m"(*lock));
+}
+static inline void x86_spin_unlock_enabled_irq(spinlock_t* lock,cpuflg_t* flags)
+{
+    __asm__ __volatile__(
+    "movl   $0, %0\n\t"
+    "pushq %1 \n\t"
+    "popfq \n\t"
+    :
+    : "m"(*lock), "m"(*flags));
+}
+```
+
+## 信号量
+
+- 无论是原子操作还是自旋锁，都不适合长时间等待的情况，因为很多资源（数据）都有一定的时间性，CPU不能立刻返回资源（数据），而是要等待一段时间。这种情况下，使用自旋锁会浪费CPU时间。
+- 信号量既能对资源数据进行保护（同一时刻只有一个代码执行流访问），又能在资源无法满足的情况下，让 CPU 可以执行其它任务。
+- 信号量实现的三个问题：等待、互斥、唤醒（即重新激活等待的代码执行流程）。
+- 根据上面的问题，这个数据结构至少需要一个变量来表示互斥，比如大于 0 则代码执行流可以继续运行，等于 0 则让代码执行流进入等待状态。还需要一个等待链，用于保存等待的代码执行流。
+
+```c
+#define SEM_FLG_MUTEX 0
+#define SEM_FLG_MULTI 1
+#define SEM_MUTEX_ONE_LOCK 1
+#define SEM_MULTI_LOCK 0
+//等待链数据结构，用于挂载等待代码执行流（线程）的结构，里面有用于挂载代码执行流的链表和计数器变量，这里我们先不深入研究这个数据结构。
+typedef struct s_KWLST{   
+    spinlock_t wl_lock;
+    uint_t   wl_tdnr;
+    list_h_t wl_list;
+}kwlst_t;
+//信号量数据结构
+typedef struct s_SEM{
+    spinlock_t sem_lock;//维护sem_t自身数据的自旋锁
+    uint_t sem_flg;//信号量相关的标志
+    sint_t sem_count;//信号量计数值
+    kwlst_t sem_waitlst;//用于挂载等待代码执行流（线程）结构
+}sem_t;
+```
+
+### 信号量用法
+
+1. 初始化
+2. 获取信号量
+   1. 对用于保护信号量自身的自旋锁sem_lock进行加锁
+   2. 对信号值sem_count执行“减1”操作，并检查其值是否小于0
+   3. 如果小于0，就让进程进入等待状态并将其挂入sem_waitlst中，然后调度其它进程运行；否则表示获取信号量成功
+   4. 对自旋锁sem_lock进行解锁
+3. 代码执行流开始执行相关操作
+4. 释放信号量
+   1. 对用于保护信号量自身的自旋锁 sem_lock 进行加锁
+   2. 对信号值 sem_count 执行“加 1”操作，并检查其值是否大于 0
+   3. 检查 sem_count 值如果大于 0，就执行唤醒 sem_waitlst 中进程的操作，并且需要调度进程时就执行进程调度操作，不管 sem_count 是否大于 0（通常会大于 0）都标记信号量释放成功
+   4. 对自旋锁 sem_lock 进行解锁
+
+```c
+//获取信号量
+void krlsem_down(sem_t* sem){
+    cpuflg_t cpufg;
+start_step:    
+    krlspinlock_cli(&sem->sem_lock,&cpufg);
+    if(sem->sem_count<1){//如果信号量值小于1,则让代码执行流（线程）睡眠
+        krlwlst_wait(&sem->sem_waitlst);
+        krlspinunlock_sti(&sem->sem_lock,&cpufg);
+        krlschedul();//切换代码执行流，下次恢复执行时依然从下一行开始执行，所以要goto开始处重新获取信号量
+        goto start_step; 
+    }
+    sem->sem_count--;//信号量值减1,表示成功获取信号量
+    krlspinunlock_sti(&sem->sem_lock,&cpufg);
+    return;
+}
+//释放信号量
+void krlsem_up(sem_t* sem){
+    cpuflg_t cpufg;
+    krlspinlock_cli(&sem->sem_lock,&cpufg);
+    sem->sem_count++;//释放信号量
+    if(sem->sem_count<1){//如果小于1,则说数据结构出错了，挂起系统
+        krlspinunlock_sti(&sem->sem_lock,&cpufg);
+        hal_sysdie("sem up err");
+    }
+    //唤醒该信号量上所有等待的代码执行流（线程）
+    krlwlst_allup(&sem->sem_waitlst);
+    krlspinunlock_sti(&sem->sem_lock,&cpufg);
+    krlsched_set_schedflgs();
+    return;
+}
+//krlspinlock_cli，krlspinunlock_sti两个函数是对前面自旋锁函数的一个封装
+```
+
+## 总结
+
+1. 原子变量，在只有单个变量全局数据的情况下，这种变量非常实用，如全局计数器、状态标志变量等。
+
+2. 中断的控制。当要操作的数据很多的情况下，用原子变量就不适合了。但是在单核心的 CPU，同一时刻只有一个代码执行流，除了响应中断导致代码执行流切换，不会有其它条件会干扰全局数据的操作，所以只要在操作全局数据时关闭或者开启中断即可。
+
+3. 自旋锁。由于多核心的 CPU 出现，控制中断已经失效了，因为系统中同时有多个代码执行流，为了解决这个问题，开发了自旋锁，自旋锁要么一下子获取锁，要么循环等待最终获取锁。
+
+4. 信号量。如果长时间等待后才能获取数据，在这样的情况下，前面中断控制和自旋锁都不能很好地解决，于是开发了信号量。信号量由一套数据结构和函数组成，它能使获取数据的代码执行流进入睡眠，然后在相关条件满足时被唤醒，这样就能让 CPU 能有时间处理其它任务。所以信号量同时解决了三个问题：等待、互斥、唤醒。
+
+5. 自旋锁和信号量的使用形式：
+
+   ```c
+   spinlock_t lock;
+     x86_spin_lock_init(&lock);
+     // 加锁，如果加锁成功则进入下面代码执行
+     // 否则，一直自旋，不断检查 lock 值为否为 0
+     x86_spin_lock_disable_irq(&lock);
+     // 处理一些数据同步、协同场景
+     doing_something();
+     // 解锁
+     x86_spin_unlock_enabled_irq(&lock);
+   
+   
+     sem_t sem;
+     x86_sem_init(&sem);
+     // 加锁，减少信号量，如果信号量已经为 0
+     // 则加锁失败，当前线程会改变为 sleeping 状态
+     // 并让出 CPU 执行权
+     krlsem_down(&sem);
+     // 处理一些数据同步、协同场景
+     doing_something();
+     // 解锁，增加信号量，唤醒等待队列中的其它线程（若存在）
+     krlsem_up(&sem);
+   ```
+
+
+
+# 09 Linux的自旋锁和信号量的实现
+
+## Linux的原子变量atomic_t
+
+```c
+typedef struct {
+    int counter;
+} atomic_t;//常用的32位的原子变量类型
+#ifdef CONFIG_64BIT
+typedef struct {
+    s64 counter;
+} atomic64_t;//64位的原子变量类型
+#endif
+```
+
+接口函数：https://elixir.bootlin.com/linux/v5.10.13/source/arch/x86/include/asm/atomic.h#L23
+
+```c
+
+//原子读取变量中的值
+static __always_inline int arch_atomic_read(const atomic_t *v)
+{
+    return __READ_ONCE((v)->counter);
+}
+//原子写入一个具体的值
+static __always_inline void arch_atomic_set(atomic_t *v, int i)
+{
+    __WRITE_ONCE(v->counter, i);
+}
+//原子加上一个具体的值
+static __always_inline void arch_atomic_add(int i, atomic_t *v)
+{
+    asm volatile(LOCK_PREFIX "addl %1,%0"
+             : "+m" (v->counter)
+             : "ir" (i) : "memory");
+}
+//原子减去一个具体的值
+static __always_inline void arch_atomic_sub(int i, atomic_t *v)
+{
+    asm volatile(LOCK_PREFIX "subl %1,%0"
+             : "+m" (v->counter)
+             : "ir" (i) : "memory");
+}
+//原子加1
+static __always_inline void arch_atomic_inc(atomic_t *v)
+{
+    asm volatile(LOCK_PREFIX "incl %0"
+             : "+m" (v->counter) :: "memory");
+}
+//原子减1
+static __always_inline void arch_atomic_dec(atomic_t *v)
+{
+    asm volatile(LOCK_PREFIX "decl %0"
+             : "+m" (v->counter) :: "memory");
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
