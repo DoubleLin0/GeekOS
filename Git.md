@@ -1,5 +1,9 @@
 # Git
 
+https://www.w3cschool.cn/githubcn/
+
+token：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
+
 ##  查看本地、切换分支、缓存、更新 、合并
 
 ```
