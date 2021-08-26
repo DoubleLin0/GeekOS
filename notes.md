@@ -1831,11 +1831,127 @@ static inline void arch_write_lock(arch_rwlock_t*rw){
 
 锁，保证了数据的安全访问，但是它给程序的并行性能造成了巨大损害，所以在设计一个算法时应尽量避免使用锁。若无法避免，则应根据实际情况使用相应类型的锁，以降低锁的不当使用带来的性能损失。
 
+# 10~12 设置工作模式与环境
+
+## 建立计算机
+
+搭建操作系统的测试环境
+
+### 内核映像格式
+
+封装内核映像文件（包含二级引导器的模块，内核模块，图片和字库文件），内核映像文件格式如下：
+
+![img](https://static001.geekbang.org/resource/image/e4/14/e4000be6a176d1fd09b99bf6df02f914.jpg)
+
+GRUB 头有 4KB 大小，GRUB 正是通过这一小段代码，来识别映像文件的。另外，根据映像文件头描述符和文件头描述符里的信息，这一小段代码还可以解析映像文件中的其它文件。
+
+映像文件头描述符和文件描述符结构体如下：
+
+```c++
+
+//映像文件头描述符
+typedef struct s_mlosrddsc
+{
+    u64_t mdc_mgic; //映像文件标识
+    u64_t mdc_sfsum;//未使用
+    u64_t mdc_sfsoff;//未使用
+    u64_t mdc_sfeoff;//未使用
+    u64_t mdc_sfrlsz;//未使用
+    u64_t mdc_ldrbk_s;//映像文件中二级引导器的开始偏移
+    u64_t mdc_ldrbk_e;//映像文件中二级引导器的结束偏移
+    u64_t mdc_ldrbk_rsz;//映像文件中二级引导器的实际大小
+    u64_t mdc_ldrbk_sum;//映像文件中二级引导器的校验和
+    u64_t mdc_fhdbk_s;//映像文件中文件头描述的开始偏移
+    u64_t mdc_fhdbk_e;//映像文件中文件头描述的结束偏移
+    u64_t mdc_fhdbk_rsz;//映像文件中文件头描述的实际大小
+    u64_t mdc_fhdbk_sum;//映像文件中文件头描述的校验和
+    u64_t mdc_filbk_s;//映像文件中文件数据的开始偏移
+    u64_t mdc_filbk_e;//映像文件中文件数据的结束偏移
+    u64_t mdc_filbk_rsz;//映像文件中文件数据的实际大小
+    u64_t mdc_filbk_sum;//映像文件中文件数据的校验和
+    u64_t mdc_ldrcodenr;//映像文件中二级引导器的文件头描述符的索引号
+    u64_t mdc_fhdnr;//映像文件中文件头描述符有多少个
+    u64_t mdc_filnr;//映像文件中文件头有多少个
+    u64_t mdc_endgic;//映像文件结束标识
+    u64_t mdc_rv;//映像文件版本
+}mlosrddsc_t;
+
+#define FHDSC_NMAX 192 //文件名长度
+//文件头描述符
+typedef struct s_fhdsc
+{
+    u64_t fhd_type;//文件类型
+    u64_t fhd_subtype;//文件子类型
+    u64_t fhd_stuts;//文件状态
+    u64_t fhd_id;//文件id
+    u64_t fhd_intsfsoff;//文件在映像文件位置开始偏移
+    u64_t fhd_intsfend;//文件在映像文件的结束偏移
+    u64_t fhd_frealsz;//文件实际大小
+    u64_t fhd_fsum;//文件校验和
+    char   fhd_name[FHDSC_NMAX];//文件名
+}fhdsc_t;
+```
+
+打包映像的工具
+
+```shell
+lmoskrlimg -m k -lhf GRUB 头文件 -o 映像文件 -f 输入的文件列表
+# -m 表示模式，只能是k内核模式
+# -lhf 表示后面跟上GRUB头文件
+# -o 表示输出的映像文件名
+# -f 表示输入文件列表
+# eg: lmoskrlimg -m k -lhf grubhead.bin -o kernel.img -f file1.bin file2.bin file3.bin file4.bin
+```
+
+### 虚拟机安装和使用
+
+使用甲骨文公司的VirtualBox虚拟机，功能相对完善、性能强、BUG 少，而且比较稳定
+
+```shell
+sudo apt-get install virtualbox-6.1
+```
 
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 建造二级引导器
+
+实现一个初始化环境的组件——二级引导器，继承CRUB权力
+
+
+
+
+
+## 探查和收集信息
+
+对硬件抽象层进行初始化
+
+
+
+
+
+# 13 第一个C函数：如何实现板级初始化
 
 
 
